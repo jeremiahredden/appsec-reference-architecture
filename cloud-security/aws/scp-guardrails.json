@@ -1,0 +1,159 @@
+{
+  "_comment": "Five production-ready AWS Service Control Policies. Each object in 'policies' is a complete SCP document ready to attach to an OU via AWS Organizations. Read iam-least-privilege.md for context on each. Deploy to a non-prod OU first, observe for at least 7 days, then roll to prod OU.",
+  "_schema_version": "2026-04",
+  "_author_guidance": "Customize: (1) region list in DenyRegionsOutsideApproved; (2) trail ARN in ProtectCloudTrail; (3) break-glass exceptions via aws:PrincipalArn if your operational model requires them.",
+  "policies": {
+    "DenyRootUser": {
+      "_description": "Deny all actions performed as the account root user. Root should never be used day-to-day; any call as root is a signal. Apply to workload OUs, NOT to the management account's own OU — you can lock yourself out.",
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "DenyRootUser",
+          "Effect": "Deny",
+          "Action": "*",
+          "Resource": "*",
+          "Condition": {
+            "StringLike": {
+              "aws:PrincipalArn": "arn:aws:iam::*:root"
+            }
+          }
+        }
+      ]
+    },
+    "RequireMFAForIAMUserConsole": {
+      "_description": "Deny most actions for IAM users (not federated identities) that have not presented MFA in the session. NotAction list covers the calls required to actually set up MFA on first login and to obtain a session token. Federated callers from IAM Identity Center are unaffected because the MFA presence key is evaluated against IAM users, not federated principals.",
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "RequireMFAForConsole",
+          "Effect": "Deny",
+          "NotAction": [
+            "iam:CreateVirtualMFADevice",
+            "iam:EnableMFADevice",
+            "iam:GetUser",
+            "iam:ListMFADevices",
+            "iam:ListVirtualMFADevices",
+            "iam:ResyncMFADevice",
+            "iam:ChangePassword",
+            "sts:GetSessionToken"
+          ],
+          "Resource": "*",
+          "Condition": {
+            "BoolIfExists": {
+              "aws:MultiFactorAuthPresent": "false"
+            },
+            "Null": {
+              "aws:MultiFactorAuthPresent": "false"
+            }
+          }
+        }
+      ]
+    },
+    "ProtectCloudTrail": {
+      "_description": "Prevent anyone in a member account from stopping, deleting, or modifying the organization CloudTrail. Replace 'org-trail' with the actual name of your organization trail. Note: legitimate account-level CloudTrail operations on per-account trails (if any) remain permitted; this SCP protects the org-wide trail only.",
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "ProtectOrgCloudTrail",
+          "Effect": "Deny",
+          "Action": [
+            "cloudtrail:StopLogging",
+            "cloudtrail:DeleteTrail",
+            "cloudtrail:UpdateTrail",
+            "cloudtrail:PutEventSelectors",
+            "cloudtrail:RemoveTags"
+          ],
+          "Resource": "arn:aws:cloudtrail:*:*:trail/org-trail"
+        }
+      ]
+    },
+    "DenyS3PublicAccess": {
+      "_description": "Defense in depth with account-level S3 Block Public Access. Blocks the API calls that would make a bucket or object public. Also prevents a member account from disabling the account-level Block Public Access setting. If you have legitimate public buckets (e.g., marketing assets), put them in a separate OU where this SCP is not attached.",
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "DenyPublicACLs",
+          "Effect": "Deny",
+          "Action": [
+            "s3:PutBucketAcl",
+            "s3:PutObjectAcl"
+          ],
+          "Resource": "*",
+          "Condition": {
+            "StringEqualsIfExists": {
+              "s3:x-amz-acl": [
+                "public-read",
+                "public-read-write",
+                "authenticated-read"
+              ]
+            }
+          }
+        },
+        {
+          "Sid": "DenyDisablingAccountBlockPublicAccess",
+          "Effect": "Deny",
+          "Action": [
+            "s3:PutAccountPublicAccessBlock",
+            "s3:DeleteAccountPublicAccessBlock"
+          ],
+          "Resource": "*",
+          "Condition": {
+            "Bool": {
+              "aws:PrincipalIsAWSService": "false"
+            }
+          }
+        },
+        {
+          "Sid": "DenyDisablingBucketBlockPublicAccess",
+          "Effect": "Deny",
+          "Action": [
+            "s3:PutBucketPublicAccessBlock"
+          ],
+          "Resource": "*",
+          "Condition": {
+            "BoolIfExists": {
+              "s3:BlockPublicAcls": "false",
+              "s3:BlockPublicPolicy": "false",
+              "s3:IgnorePublicAcls": "false",
+              "s3:RestrictPublicBuckets": "false"
+            }
+          }
+        }
+      ]
+    },
+    "RequireIMDSv2OnEC2": {
+      "_description": "Mitigates SSRF-based credential theft from the EC2 instance metadata service. Blocks RunInstances unless IMDSv2 is required, and blocks ModifyInstanceMetadataOptions from downgrading an existing instance to IMDSv1. IMDSv2 is the default on newer AMIs but existing launch templates and automation may still be v1.",
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "RunInstancesRequireIMDSv2",
+          "Effect": "Deny",
+          "Action": "ec2:RunInstances",
+          "Resource": "arn:aws:ec2:*:*:instance/*",
+          "Condition": {
+            "StringNotEquals": {
+              "ec2:MetadataHttpTokens": "required"
+            }
+          }
+        },
+        {
+          "Sid": "DenyDowngradeToIMDSv1",
+          "Effect": "Deny",
+          "Action": "ec2:ModifyInstanceMetadataOptions",
+          "Resource": "arn:aws:ec2:*:*:instance/*",
+          "Condition": {
+            "StringEquals": {
+              "ec2:MetadataHttpTokens": "optional"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "_deployment_notes": [
+    "Attach to the non-prod OU first. Let it run for 7 days without reports of false-positive fires.",
+    "Review denied actions in CloudTrail (eventSource=*.amazonaws.com AND errorCode=AccessDenied AND errorMessage like '%explicit deny in a service control policy%') during the observation window.",
+    "If a legitimate workload needs something the SCP denies, the right answer is usually to fix the workload, not the SCP. Document any exception and apply via a tagged exception role with a sunset date.",
+    "Attach to prod OUs only after non-prod is clean."
+  ]
+}

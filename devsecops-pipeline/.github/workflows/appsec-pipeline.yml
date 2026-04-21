@@ -1,0 +1,388 @@
+# =============================================================================
+# AppSec Pipeline — the main security workflow.
+#
+# Runs on every pull request and every push to the default branch. Each job
+# is independent so a single slow scanner does not serialize the others.
+# Results are uploaded as artifacts (for the security team's records) and
+# summarized as a single PR comment (for the developer's feedback loop).
+#
+# Permissions are set at the workflow level as read-only; jobs that need more
+# (e.g., the summary job needs `pull-requests: write`) opt in explicitly.
+# This is the GitHub-recommended pattern — start least-privileged, grant
+# per-job.
+#
+# Design notes:
+#   - continue-on-error is used on individual tools while rolling the
+#     pipeline out. When the team trusts the output, flip to false on a
+#     job-by-job basis. See policy-as-code/break-build-policy.md for the
+#     agreed gating thresholds.
+#   - Concurrency: cancel-in-progress on PRs to avoid burning minutes on
+#     superseded commits. Default-branch runs are NOT cancelled — they are
+#     the record of the security posture of main.
+#   - Every job pins its actions to a major version. For high-assurance
+#     environments, pin to a commit SHA.
+# =============================================================================
+
+name: AppSec Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: appsec-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read              # read the code
+  security-events: write      # write SARIF to the Security tab
+  pull-requests: write        # write summary comment on PRs (summary job only)
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # secrets-scan — highest-precision gate; the one rule is "never a secret
+  # in the repo." Fails the build on any finding. Gitleaks runs across the
+  # full git history on default-branch pushes and against the PR diff on
+  # pull requests (faster, scoped to what the contributor is adding).
+  # ---------------------------------------------------------------------------
+  secrets-scan:
+    name: Secrets Scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history is required for history-mode gitleaks scans.
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_ENABLE_COMMENTS=false keeps the job from commenting
+          # directly — we aggregate all findings in the summary job.
+          GITLEAKS_ENABLE_COMMENTS: false
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: true
+          GITLEAKS_ENABLE_SUMMARY: true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # sast — Semgrep, with the `p/default` ruleset plus the custom rules
+  # committed to this repo under devsecops-pipeline/semgrep-rules/. Results
+  # are uploaded as SARIF to the Security tab and as an artifact.
+  #
+  # --error --severity=ERROR means: exit non-zero only if an ERROR-severity
+  # finding is present. WARNING and INFO findings are reported but do not
+  # break the build. This matches the policy in break-build-policy.md.
+  # ---------------------------------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        # `semgrep ci` auto-detects the ruleset from Semgrep Cloud when
+        # SEMGREP_APP_TOKEN is set. Without the token it falls back to
+        # --config= values passed explicitly. We pass both the managed
+        # ruleset and our local custom-rules file.
+        run: |
+          semgrep ci \
+            --config=p/default \
+            --config=devsecops-pipeline/semgrep-rules/custom-rules.yaml \
+            --sarif --output=semgrep.sarif \
+            --error --severity=ERROR \
+            --metrics=off
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        # While rolling out, set continue-on-error: true and triage
+        # findings. Flip to false once the baseline is clean.
+        continue-on-error: false
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Upload Semgrep report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep.sarif
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # sca-python — pip-audit against requirements files and the lockfile.
+  # Runs only if Python manifests are present. Fails on any high-severity
+  # (CVSS ≥ 7.0) finding.
+  #
+  # The JSON output is parsed with jq to do the severity gate, since
+  # pip-audit does not have a built-in severity threshold flag.
+  # ---------------------------------------------------------------------------
+  sca-python:
+    name: SCA — Python (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Python manifest
+        id: detect
+        run: |
+          if ls requirements*.txt pyproject.toml poetry.lock Pipfile.lock 2>/dev/null | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit
+        if: steps.detect.outputs.present == 'true'
+        run: pip install pip-audit==2.*
+
+      - name: Run pip-audit
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          pip-audit --format json --output pip-audit.json --progress-spinner=off \
+            || true  # capture output; gate on severity below
+
+          # Fail if any finding has CVSS ≥ 7.0 per break-build policy.
+          high_count=$(jq '[.dependencies[]?.vulns[]?
+                            | select((.aliases // []) | length > 0)
+                            | select(((.severity // "UNKNOWN") | ascii_upcase)
+                                     | IN("HIGH","CRITICAL"))] | length' \
+                       pip-audit.json)
+
+          echo "High-or-critical Python dependency findings: $high_count"
+          if [ "$high_count" -gt 0 ]; then
+            echo "::error::Python dependency scan found $high_count high/critical findings"
+            exit 1
+          fi
+
+      - name: Upload pip-audit report
+        if: always() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-report
+          path: pip-audit.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # sca-javascript — npm audit at --audit-level=high. Runs only if a
+  # package-lock.json is present; an absent lockfile is itself a finding in
+  # review, but the SCA job cannot produce useful output without one.
+  # ---------------------------------------------------------------------------
+  sca-javascript:
+    name: SCA — JavaScript (npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect Node manifest
+        id: detect
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run npm audit
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          # --audit-level=high: exit non-zero only if high/critical are found.
+          # --omit=dev: production dependencies only.
+          npm audit --audit-level=high --omit=dev --json > npm-audit.json \
+            || audit_exit=$?
+
+          # Produce a human-readable summary alongside the JSON artifact.
+          npm audit --audit-level=high --omit=dev || true
+
+          # Fail the job on the captured exit code from the --json run.
+          exit "${audit_exit:-0}"
+
+      - name: Upload npm-audit report
+        if: always() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: npm-audit.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # iac-scan — thin wrapper that delegates to the dedicated iac-scan.yml
+  # workflow for results on infrastructure changes. The dedicated workflow
+  # handles SARIF upload, path filtering, and the broader Checkov config.
+  # This job exists here only so the summary job has one place to look.
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: IaC Scan (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect IaC content
+        id: detect
+        run: |
+          if ls -R 2>/dev/null \
+             | grep -E '\.(tf|tf\.json|yaml|yml|json)$' \
+             | xargs -I{} grep -l -E 'resource "aws_|AWSTemplateFormatVersion|kind: (Deployment|Pod|Service)' {} 2>/dev/null \
+             | head -1 | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Checkov
+        if: steps.detect.outputs.present == 'true'
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          quiet: true
+          soft_fail: false        # fail on any detected misconfiguration ≥ medium
+          framework: terraform,cloudformation,kubernetes,dockerfile,arm
+          output_format: sarif
+          output_file_path: checkov.sarif
+          skip_check: CKV_AWS_79  # example: IMDSv1 — replace with the real
+                                  # suppressions for your infra, each with
+                                  # a justified comment.
+
+      - name: Upload Checkov SARIF
+        if: always() && steps.detect.outputs.present == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+      - name: Upload Checkov report
+        if: always() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: checkov.sarif
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # dependency-review — runs only on PRs. Shows the reviewer exactly which
+  # packages are being added/updated and any CVEs they introduce. GitHub-
+  # native, free, no external service dependency.
+  # ---------------------------------------------------------------------------
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+          # Deny copyleft licenses for services that ship as binaries; edit
+          # the list per project. Comment out if not applicable.
+          deny-licenses: GPL-2.0, GPL-3.0, AGPL-3.0
+          comment-summary-in-pr: on-failure
+
+  # ---------------------------------------------------------------------------
+  # summary — aggregates the per-job results into a single PR comment so the
+  # developer sees one digest instead of six separate workflow runs. Uses
+  # actions/github-script to format the body.
+  # ---------------------------------------------------------------------------
+  summary:
+    name: AppSec Summary
+    runs-on: ubuntu-latest
+    needs: [secrets-scan, sast, sca-python, sca-javascript, iac-scan, dependency-review]
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Post summary comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const needs = ${{ toJSON(needs) }};
+            const emoji = (r) =>
+              r === 'success' ? '[OK]'
+              : r === 'skipped' ? '[SKIPPED]'
+              : r === 'cancelled' ? '[CANCELLED]'
+              : '[FAILED]';
+
+            const rows = Object.entries(needs).map(
+              ([job, { result }]) => `| \`${job}\` | ${emoji(result)} ${result} |`
+            ).join('\n');
+
+            const runUrl =
+              `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+              `/actions/runs/${context.runId}`;
+
+            const body = [
+              '### AppSec Pipeline Summary',
+              '',
+              '| Job | Result |',
+              '| --- | --- |',
+              rows,
+              '',
+              `See the [full run](${runUrl}) and the "Security" tab for SARIF findings.`,
+              '',
+              '> Break-build rules and the exception process are documented in',
+              '> `devsecops-pipeline/policy-as-code/break-build-policy.md`.',
+            ].join('\n');
+
+            // Upsert: replace the previous summary comment on this PR if one
+            // exists, so the PR is not cluttered with historical summaries.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(
+              (c) => c.user?.type === 'Bot'
+                 && c.body?.startsWith('### AppSec Pipeline Summary'),
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }

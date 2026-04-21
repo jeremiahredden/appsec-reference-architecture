@@ -1,0 +1,180 @@
+# =============================================================================
+# IaC Security Scan — dedicated workflow for infrastructure changes.
+#
+# Why a dedicated workflow:
+#   - Path filtering. Checkov against a whole repo is slow and noisy; this
+#     workflow runs only when infrastructure code changes, on the files that
+#     actually changed.
+#   - Framework fan-out. Terraform, CloudFormation, ARM, Kubernetes,
+#     Dockerfile, and Helm are all supported by Checkov but benefit from
+#     distinct configuration (different baselines, different suppressions).
+#   - Dedicated SARIF categories. Each framework gets its own `category`
+#     so the GitHub Security tab groups findings sensibly.
+#
+# Result of this workflow:
+#   - SARIF uploaded to the repo's Security tab, one category per framework.
+#   - JSON artifacts retained for 90 days for audit evidence.
+#   - Build-breaking failure only on findings at severity HIGH or CRITICAL
+#     (per policy-as-code/break-build-policy.md).
+# =============================================================================
+
+name: IaC Security Scan
+
+on:
+  pull_request:
+    branches: [main]
+    # Only run when infra files actually change. Edit the globs to match the
+    # conventions of the target repo.
+    paths:
+      - 'infrastructure/**'
+      - 'terraform/**'
+      - 'cloudformation/**'
+      - 'arm-templates/**'
+      - 'k8s/**'
+      - 'kubernetes/**'
+      - 'helm/**'
+      - 'charts/**'
+      - '**/*.tf'
+      - '**/*.tf.json'
+      - '**/Dockerfile'
+      - '**/Dockerfile.*'
+      - '.github/workflows/iac-scan.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/**'
+      - 'terraform/**'
+      - 'cloudformation/**'
+      - 'arm-templates/**'
+      - 'k8s/**'
+      - 'kubernetes/**'
+      - 'helm/**'
+      - 'charts/**'
+      - '**/*.tf'
+      - '**/*.tf.json'
+      - '**/Dockerfile'
+      - '**/Dockerfile.*'
+
+concurrency:
+  group: iac-scan-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # checkov — one matrix job per framework. A failure in one framework does
+  # not suppress findings in another; each runs independently and uploads its
+  # own SARIF.
+  # ---------------------------------------------------------------------------
+  checkov:
+    name: Checkov (${{ matrix.framework }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: terraform
+            directory: "."
+            category: "checkov-terraform"
+          - framework: cloudformation
+            directory: "."
+            category: "checkov-cloudformation"
+          - framework: arm
+            directory: "."
+            category: "checkov-arm"
+          - framework: kubernetes
+            directory: "."
+            category: "checkov-k8s"
+          - framework: dockerfile
+            directory: "."
+            category: "checkov-dockerfile"
+          - framework: helm
+            directory: "."
+            category: "checkov-helm"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Checkov
+        run: pip install "checkov==3.*"
+
+      - name: Run Checkov (${{ matrix.framework }})
+        id: checkov
+        run: |
+          # --soft-fail-on severity_threshold=LOW,MEDIUM:
+          #   Do not fail on LOW or MEDIUM. Keep them in the SARIF output so
+          #   they still surface in the Security tab, but do not block merges.
+          #
+          # --hard-fail-on severity_threshold=HIGH,CRITICAL:
+          #   Fail the job on HIGH or CRITICAL. This aligns with
+          #   policy-as-code/break-build-policy.md.
+          #
+          # The two flags together give the precise gating behavior we want.
+          checkov \
+            --framework ${{ matrix.framework }} \
+            --directory ${{ matrix.directory }} \
+            --output sarif --output-file-path checkov-${{ matrix.framework }}.sarif \
+            --output cli \
+            --soft-fail-on LOW,MEDIUM \
+            --hard-fail-on HIGH,CRITICAL \
+            --quiet \
+            --compact \
+            --download-external-modules true \
+            || exit_code=$?
+
+          # Persist exit code for the upload step; do not halt the job yet so
+          # the SARIF is always uploaded even on a failing scan.
+          echo "exit_code=${exit_code:-0}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-${{ matrix.framework }}.sarif
+          category: ${{ matrix.category }}
+        # The SARIF may be empty if the framework has no files in this repo.
+        # That is fine — the action handles empty input gracefully.
+
+      - name: Upload Checkov report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-${{ matrix.framework }}-report
+          path: checkov-${{ matrix.framework }}.sarif
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Fail job if hard-fail threshold triggered
+        if: always()
+        run: |
+          exit ${{ steps.checkov.outputs.exit_code }}
+
+  # ---------------------------------------------------------------------------
+  # tfsec (optional, complementary to Checkov) — tfsec has stronger Terraform-
+  # specific rules and catches some issues Checkov misses. Leave disabled
+  # until the Checkov baseline is clean; running both produces noise until
+  # both are tuned.
+  # ---------------------------------------------------------------------------
+  # tfsec:
+  #   name: tfsec (Terraform)
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: aquasecurity/tfsec-sarif-action@v0.1.4
+  #       with:
+  #         sarif_file: tfsec.sarif
+  #     - uses: github/codeql-action/upload-sarif@v3
+  #       with:
+  #         sarif_file: tfsec.sarif
+  #         category: tfsec

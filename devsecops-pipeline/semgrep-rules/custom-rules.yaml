@@ -1,0 +1,245 @@
+# =============================================================================
+# Custom Semgrep rules — organization-specific patterns.
+#
+# Design notes:
+#   - Every rule is scoped to a specific, high-signal pattern. Low-precision
+#     rules do more harm than good; they train developers to ignore the tool.
+#   - Severity is ERROR for issues that break the build (see
+#     policy-as-code/break-build-policy.md) and WARNING for issues that
+#     should be visible but not blocking.
+#   - Every rule includes metadata with a CWE reference and an OWASP Top 10
+#     mapping. This makes Security-tab findings navigable for auditors and
+#     gives developers a canonical explanation to read.
+#   - Adding a rule: drop it in this file, open a PR with a passing run
+#     against the default branch, include rationale for severity and
+#     expected false-positive rate. Review every custom rule at 90 days to
+#     confirm it still catches real issues.
+# =============================================================================
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. Flask debug=True on a deploy path.
+  #
+  # Werkzeug's debugger (which Flask enables when DEBUG=True) exposes an
+  # interactive Python console on any exception. If the process is reachable
+  # from the internet, this is remote code execution. Historical root cause
+  # of multiple high-profile breaches (Patreon 2015 is the canonical example).
+  # Never correct in production code.
+  # ---------------------------------------------------------------------------
+  - id: flask-debug-true
+    message: |
+      Flask is started with debug=True. Werkzeug's debugger enables an
+      interactive Python console on any unhandled exception, which is
+      remote code execution if the process is reachable. Remove debug=True,
+      or gate it behind an environment check that cannot be true in prod.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $APP.run(..., debug=True, ...)
+          - pattern: |
+              flask.Flask(...).run(..., debug=True, ...)
+          - pattern: |
+              Flask(...).run(..., debug=True, ...)
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 — Security Misconfiguration"
+      category: security
+      technology: [flask, python]
+      references:
+        - https://werkzeug.palletsprojects.com/en/latest/debug/
+        - https://cwe.mitre.org/data/definitions/489.html
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [audit]
+
+  # ---------------------------------------------------------------------------
+  # 2. MD5 / SHA-1 used for password hashing in Python.
+  #
+  # MD5 and SHA-1 are fast, unsalted (when called this way), and crackable
+  # at ~10 billion guesses per second on consumer GPUs. Not password hashes.
+  # Use Argon2id, bcrypt, or scrypt. The pattern targets the common shape:
+  # hashlib.md5(password.encode()) / hashlib.sha1(password.encode()).
+  # ---------------------------------------------------------------------------
+  - id: weak-password-hash
+    message: |
+      MD5 and SHA-1 are fast hash functions, not password hashes. A GPU
+      rig cracks them at ~10 billion guesses/sec. Use argon2-cffi
+      (Argon2id), bcrypt, or scrypt for password hashing. Fast-hash
+      patterns are typically the work of a well-intentioned author who
+      reached for hashlib; fix at the call site, then audit the rest of
+      the module for the same mistake.
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: hashlib.md5($PW.encode(...)).$ANY()
+          - pattern: hashlib.sha1($PW.encode(...)).$ANY()
+          - pattern: hashlib.new("md5", $PW.encode(...))
+          - pattern: hashlib.new("sha1", $PW.encode(...))
+      - metavariable-regex:
+          metavariable: $PW
+          regex: "(?i).*(password|passwd|pwd|secret|token).*"
+    metadata:
+      cwe: "CWE-916: Use of Password Hash With Insufficient Computational Effort"
+      owasp: "A02:2021 — Cryptographic Failures"
+      category: security
+      technology: [cryptography, python]
+      references:
+        - https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html
+        - https://cwe.mitre.org/data/definitions/916.html
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+
+  # ---------------------------------------------------------------------------
+  # 3. Hardcoded AWS access key pattern.
+  #
+  # AWS access keys have a strict structure: AKIA (long-lived, IAM user),
+  # ASIA (session), or AKIATEST for SDK tests. A literal string matching
+  # the format in code is treated as a live credential — removing the line
+  # is not remediation. Rotate at the source, then purge from git history.
+  # ---------------------------------------------------------------------------
+  - id: hardcoded-aws-access-key
+    message: |
+      Hardcoded AWS access key detected. Treat this credential as
+      compromised: rotate in AWS IAM immediately, then purge from git
+      history. Production secrets must come from AWS Secrets Manager,
+      SSM Parameter Store, or the runtime's IAM role — never from source.
+    severity: ERROR
+    languages: [python, javascript, typescript, generic]
+    patterns:
+      - pattern-regex: |
+          (?<![A-Z0-9])(AKIA|ASIA|AKIATEST)[A-Z0-9]{16}(?![A-Z0-9])
+    paths:
+      exclude:
+        - "**/tests/**"
+        - "**/*.test.*"
+        - "**/*.spec.*"
+        - "**/fixtures/**"
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 — Identification and Authentication Failures"
+      category: security
+      technology: [aws, secrets]
+      references:
+        - https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
+        - https://cwe.mitre.org/data/definitions/798.html
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+
+  # ---------------------------------------------------------------------------
+  # 4. eval() with user-controlled input in JavaScript/TypeScript.
+  #
+  # eval() of any attacker-influenced string is remote code execution. The
+  # rule targets the common pattern: eval(req.body.X) or eval(req.query.X).
+  # It also flags `new Function(...)` with request input, which is the
+  # equally-dangerous sibling. The check looks for taint from Express /
+  # Next / Fastify request sources.
+  # ---------------------------------------------------------------------------
+  - id: eval-on-request-input
+    message: |
+      eval() (or new Function(...)) is being invoked on data derived from
+      the request. This is remote code execution. Replace with a constrained
+      expression evaluator (mathjs for arithmetic, jsonata for JSON
+      transforms, or a purpose-built parser), never eval on untrusted input.
+    severity: ERROR
+    languages: [javascript, typescript]
+    patterns:
+      - pattern-either:
+          - pattern: eval($REQ.body.$FIELD)
+          - pattern: eval($REQ.query.$FIELD)
+          - pattern: eval($REQ.params.$FIELD)
+          - pattern: eval($REQ.body[$FIELD])
+          - pattern: eval($REQ.query[$FIELD])
+          - pattern: new Function($REQ.body.$FIELD)
+          - pattern: new Function($REQ.query.$FIELD)
+          - pattern: new Function($REQ.body[$FIELD])
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      owasp: "A03:2021 — Injection"
+      category: security
+      technology: [javascript, express]
+      references:
+        - https://owasp.org/www-community/attacks/Code_Injection
+        - https://cwe.mitre.org/data/definitions/95.html
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+
+  # ---------------------------------------------------------------------------
+  # 5. Flask route missing authentication decorator.
+  #
+  # Every non-public route in a Flask app should sit behind @login_required,
+  # @jwt_required(), @requires_auth, or an equivalent organization-specific
+  # decorator. Routes that forget authentication are the dominant source of
+  # IDOR and authorization-bypass bugs.
+  #
+  # This rule matches a route handler decorated with @app.route /
+  # @blueprint.route and no @login_required / @jwt_required() sibling.
+  # Public endpoints should explicitly opt out with an @allow_anonymous
+  # marker and a code comment; the rule exempts that marker.
+  #
+  # False-positive note: the rule is deliberately broad. Tune to your
+  # authentication decorator names in `metavariable-regex` below.
+  # ---------------------------------------------------------------------------
+  - id: flask-route-missing-auth
+    message: |
+      Flask route is exposed without an authentication decorator. Add
+      @login_required / @jwt_required() / @requires_auth as appropriate,
+      or mark the route @allow_anonymous with a code comment explaining
+      why the endpoint is public.
+    severity: WARNING
+    languages: [python]
+    patterns:
+      - pattern-either:
+          - pattern: |
+              @$APP.route(...)
+              def $HANDLER(...):
+                ...
+          - pattern: |
+              @$BP.route(...)
+              def $HANDLER(...):
+                ...
+      - pattern-not: |
+          @$APP.route(...)
+          @$AUTH_DECORATOR(...)
+          def $HANDLER(...):
+            ...
+      - pattern-not: |
+          @$BP.route(...)
+          @$AUTH_DECORATOR(...)
+          def $HANDLER(...):
+            ...
+      - pattern-not: |
+          @$APP.route(...)
+          @$AUTH_DECORATOR
+          def $HANDLER(...):
+            ...
+      - pattern-not: |
+          @$BP.route(...)
+          @$AUTH_DECORATOR
+          def $HANDLER(...):
+            ...
+      - metavariable-regex:
+          metavariable: $AUTH_DECORATOR
+          regex: "(login_required|jwt_required|requires_auth|auth_required|allow_anonymous|token_required)"
+    metadata:
+      cwe: "CWE-306: Missing Authentication for Critical Function"
+      owasp: "A01:2021 — Broken Access Control"
+      category: security
+      technology: [flask, python]
+      references:
+        - https://flask-login.readthedocs.io/en/latest/#flask_login.login_required
+        - https://cwe.mitre.org/data/definitions/306.html
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: HIGH
+      subcategory: [audit]
