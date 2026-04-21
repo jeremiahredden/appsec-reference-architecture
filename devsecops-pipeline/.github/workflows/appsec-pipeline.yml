@@ -98,12 +98,27 @@ jobs:
 
       - name: Run Semgrep against demo-app/
         run: |
+          # Scan target is intentionally vulnerable — findings are the point.
+          # `semgrep scan` exits non-zero on findings; we explicitly treat the
+          # step as successful so (a) the badge reflects "pipeline is running,
+          # not pipeline is blocking" and (b) the SARIF upload step downstream
+          # still executes. Findings remain fully visible in the GitHub
+          # Security tab (SARIF) and as a workflow artifact.
+          #
+          # When adopting this workflow against a real (non-vulnerable) target,
+          # drop the `|| true` so the step fails the job on any finding.
+          set +e
           semgrep scan \
             --config=p/default \
             --config=devsecops-pipeline/semgrep-rules/custom-rules.yaml \
             --sarif --output=semgrep.sarif \
             --metrics=off \
             demo-app/
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::notice::Semgrep exit=$rc — findings emitted to SARIF (expected against demo-app/)"
+          fi
+          exit 0
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
