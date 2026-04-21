@@ -1,0 +1,14 @@
+title = "AppSec Reference Architecture — Gitleaks Config"
+
+[allowlist]
+  description = "Allow intentional vulnerable examples"
+  paths = [
+    "secure-code-review/vulnerable-examples",
+    "demo-app"
+  ]
+  regexes = [
+    "EXAMPLE_NOT_A_REAL_KEY",
+    "EXAMPLE/WEBHOOK/URL",
+    "supersecret123",
+    "weakpassword"
+  ]
